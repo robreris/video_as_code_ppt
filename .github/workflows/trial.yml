@@ -1,0 +1,94 @@
+name: Video Pipeline (Integrated Microservices)
+
+on:
+  push:
+    paths:
+      - "input/**/*.pptx"
+  workflow_dispatch:
+
+jobs:
+  generate-video:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v4
+
+    - name: Set up Docker
+      uses: docker/setup-buildx-action@v3
+
+    - name: Start pptx_extractor
+      run: |
+        docker run -d --rm -p 5003:5000 \
+          -v ${{ github.workspace }}/input:/app/uploads \
+          -v ${{ github.workspace }}/slides:/app/slides \
+          -v ${{ github.workspace }}/notes:/app/notes \
+          --name extractor ghcr.io/40docs/pptx_extractor:latest
+    
+    - name: Wait briefly and send PPTX
+      run: |
+        sleep 5  # Let Flask boot up
+        pptx=$(ls input/*.pptx | head -n 1)
+        echo "Sending $pptx to pptx_extractor..."
+        curl -s -X POST http://localhost:5003/extract \
+          -F "file=@$pptx"
+    
+    - name: Stop pptx_extractor
+      run: docker stop extractor
+
+
+    - name: Run TTS microservice for each extracted note
+      run: |
+        mkdir -p assets/audio
+        docker run -d --rm -p 5002:5000 \
+          -v ${{ github.workspace }}/audio:/app/audio \
+          -e SPEECH_KEY=${{ secrets.SPEECH_KEY }} \
+          -e SPEECH_REGION=${{ secrets.SPEECH_REGION }} \
+          --name tts ghcr.io/40docs/tts_microservices:latest
+
+        sleep 5  # Give Flask time to start
+
+        for file in notes/slide_*.txt; do
+          slide=$(basename "$file" .txt)
+          text=$(cat "$file" | sed 's/"/\\"/g')
+          curl -s -X POST http://localhost:5002/text-to-speech \
+            -H "Content-Type: application/json" \
+            -d "{\"text\": \"$text\", \"filename\": \"$slide\"}"
+        done
+
+        docker stop tts
+
+    - name: Move images/audio to FFmpeg structure
+      run: |
+        mkdir -p assets/images
+        cp slides/slide_*.png assets/images/
+        cp audio/*.mp3 assets/audio/ || true  # skip if none
+
+    - name: Install FFmpeg
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y ffmpeg
+
+    - name: Extract base name of PPTX
+      id: extract_name
+      run: |
+        pptx=$(ls input/*.pptx | head -n 1)
+        name=$(basename "$pptx" .pptx)
+        echo "basename=$name" >> $GITHUB_OUTPUT
+
+    - name: Clean old outputs
+      run: rm -f outputs/*.mp4 || true
+
+    - name: Run FFmpeg video producer
+      run: |
+        python scripts/create_video.py --output-name "${{ steps.extract_name.outputs.basename }}"
+
+    - name: Commit final output
+      run: |
+        git config --global user.name "github-actions[bot]"
+        git config --global user.email "github-actions[bot]@users.noreply.github.com"
+        git add outputs/${{ steps.extract_name.outputs.basename }}.mp4
+        git commit -m "Auto-generated video"
+        git push
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
